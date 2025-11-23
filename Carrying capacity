@@ -1,0 +1,160 @@
+#############################################
+# ABUNDANCE ESTIMATION (CARRYING CAPACITY) WITH 
+# FAVOURABILITY AND QUANTILE REGRESSION
+# Author: DAVIDE CARNIATO
+# Date: 05/2025
+#############################################
+
+# -------------------------------------------
+# 1. LOAD REQUIRED LIBRARIES
+# -------------------------------------------
+if (!require(pacman)) install.packages("pacman")
+pacman::p_load(ggplot2, quantreg, dplyr, readr)
+
+# -------------------------------------------
+# 2. LOAD AND PREPARE DATA
+# -------------------------------------------
+# Replace with your dataset
+abundance_data <- your_abundance_df    # Observed abundance with F_AMB column
+favorability_data <- your_fav_df       # Favorability values for projection
+
+# Remove extreme values if needed
+abundance_data <- subset(abundance_data, Total < 4600)
+
+# Remove rows with NA or non-finite values
+abundance_data <- abundance_data[complete.cases(abundance_data), ]
+
+# Optional: inspect first rows
+head(abundance_data)
+
+# -------------------------------------------
+# 3. VISUALIZE RELATIONSHIP (LOESS)
+# -------------------------------------------
+ggplot(abundance_data, aes(x = F_AMB, y = Total)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "loess", se = FALSE, color = "red") +
+  labs(title = "LOESS Curve: Empirical Relationship",
+       x = "Habitat Favorability",
+       y = "Observed Abundance") +
+  theme_minimal()
+
+# -------------------------------------------
+# 4. FIT LINEAR MODEL (REFERENCE)
+# -------------------------------------------
+lm_model <- lm(Total ~ F_AMB, data = abundance_data)
+summary(lm_model)
+
+# -------------------------------------------
+# 5. FIT MULTIPLE QUANTILE REGRESSIONS
+# -------------------------------------------
+quantiles <- c(0.25, 0.5, 0.7, 0.75, 0.8, 0.95, 0.97, 0.99)
+
+# Store results
+R1_values <- numeric(length(quantiles))
+slopes <- numeric(length(quantiles))
+models_list <- list()
+
+for (i in seq_along(quantiles)) {
+  tau <- quantiles[i]
+  
+  # Fit quantile regression
+  model <- rq(Total ~ F_AMB, tau = tau, data = abundance_data)
+  models_list[[i]] <- model
+  
+  # Predicted values
+  pred <- predict(model, newdata = abundance_data)
+  
+  # Absolute residuals (R1)
+  R1_values[i] <- sum(abs(abundance_data$Total - pred))
+  
+  # Store slope coefficient
+  slopes[i] <- coef(model)[2]
+}
+
+# Create data frames for plotting
+R1_df <- data.frame(Quantile = quantiles, R1 = R1_values)
+slopes_df <- data.frame(Quantile = quantiles, Slope = slopes)
+
+# -------------------------------------------
+# 6. PLOT R1 ACROSS QUANTILES
+# -------------------------------------------
+ggplot(R1_df, aes(x = Quantile, y = R1)) +
+  geom_line(color = "blue", size = 1) +
+  geom_point(color = "red", size = 3) +
+  labs(title = "R1 Values Across Quantiles",
+       x = "Quantile (τ)",
+       y = "R1 Value") +
+  theme_minimal()
+
+# -------------------------------------------
+# 7. PLOT SLOPES ACROSS QUANTILES
+# -------------------------------------------
+ggplot(slopes_df, aes(x = Quantile, y = Slope)) +
+  geom_line(color = "blue", size = 1) +
+  geom_point(color = "red", size = 3) +
+  labs(title = "Slope Values Across Quantiles",
+       x = "Quantile (τ)",
+       y = "Slope (F_AMB)") +
+  theme_minimal()
+
+# -------------------------------------------
+# 8. CALCULATE PSEUDO-AIC FOR MODEL SELECTION
+# -------------------------------------------
+pseudo_aic <- function(model, tau) {
+  resid <- model$y - predict(model)
+  rho_sum <- sum(resid * (tau - (resid < 0)))
+  loglik <- -length(resid) * rho_sum
+  k <- length(coef(model))
+  -2 * loglik + 2 * k
+}
+
+aic_values <- sapply(models_list, pseudo_aic, tau = quantiles)
+aic_df <- data.frame(Quantile = quantiles, PseudoAIC = aic_values)
+
+# Plot pseudo-AIC
+ggplot(aic_df, aes(x = Quantile, y = PseudoAIC)) +
+  geom_line(color = "steelblue", size = 1.2) +
+  geom_point(color = "darkred", size = 2) +
+  labs(title = "Pseudo-AIC Across Quantiles",
+       x = "Quantile (τ)",
+       y = "Pseudo-AIC") +
+  theme_minimal()
+
+# -------------------------------------------
+# 9. SELECT BEST QUANTILE (MINIMUM PSEUDO-AIC)
+# -------------------------------------------
+best_index <- which.min(aic_df$PseudoAIC)
+best_tau <- aic_df$Quantile[best_index]
+cat("Best quantile by pseudo-AIC:", best_tau, "\n")
+
+# Fit final model with best quantile
+final_model <- rq(Total ~ F_AMB, tau = best_tau, data = abundance_data)
+intercept <- coef(final_model)[1]
+slope <- coef(final_model)[2]
+
+# -------------------------------------------
+# 10. PROJECT ABUNDANCE USING FAVORABILITY DATA
+# -------------------------------------------
+favorability_data <- favorability_data %>%
+  mutate(Projected_Abundance = intercept + slope * F_AMB)
+
+# -------------------------------------------
+# 11. SUMMARIZE TOTAL ESTIMATED ABUNDANCE
+# -------------------------------------------
+total_estimated <- sum(favorability_data$Projected_Abundance, na.rm = TRUE)
+cat("Total estimated abundance:", round(total_estimated), "\n")
+
+# -------------------------------------------
+# 12. OPTIONAL: PROJECT ABUNDANCE FOR MULTIPLE QUANTILES
+# -------------------------------------------
+for (tau in quantiles) {
+  model <- models_list[which(quantiles == tau)][[1]]
+  intercept <- coef(model)[1]
+  slope <- coef(model)[2]
+  favorability_data[[paste0("Abund_q", tau*100)]] <- intercept + slope * favorability_data$F_AMB
+}
+
+# -------------------------------------------
+# 13. SAVE RESULTS (OPTIONAL)
+# -------------------------------------------
+# write.csv(favorability_data, "Projected_Abundance.csv", row.names = FALSE)
