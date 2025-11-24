@@ -1,0 +1,221 @@
+###############################################################################
+##############  MAXENT in R ###################################################
+###############################################################################
+
+# -----------------------------
+# 1. Load Libraries
+# -----------------------------
+library(sp)
+library(raster)
+library(dismo)
+library(sf)
+library(rgdal)
+library(terra)
+library(knitr)
+
+# -----------------------------
+# 2. Set Working Directory
+# -----------------------------
+# Replace with your generic project folder
+setwd("path/to/project/variables/")
+
+knitr::opts_knit$set(root.dir = "path/to/project/variables/")
+opts_chunk$set(tidy.opts = list(width.cutoff = 60), tidy = TRUE)
+
+# -----------------------------
+# 3. Prepare Environmental Data
+# -----------------------------
+# Reclassify Corine Land Cover raster
+CLC <- raster("U2018_CLC2018_V2020_20u1.tif")
+
+reclass_matrix <- matrix(c(
+  0, 12, 1,   
+  12, 23, 2, 
+  23, 35, 3,
+  35, 37, 4,
+  37, 40, 5,
+  40, 42, 6,
+  42, 45, 7,
+  45, 130, 8 
+), ncol = 3, byrow = TRUE)
+
+reclassified_raster <- reclassify(CLC, reclass_matrix)
+plot(reclassified_raster)
+writeRaster(reclassified_raster, "CLC_reclassified.tif", format = "GTiff", overwrite = TRUE)
+
+# Load raster layers
+DEM <- raster("DEM3035.asc")
+BIO1 <- raster("BIO1.asc")
+BIO12 <- raster("BIO12.asc")
+BIO15 <- raster("BIO15.asc")
+HF <- raster("HF3035.asc")
+CLC <- raster("CLC3035.asc")
+
+# Stack rasters for processing
+clim <- stack(BIO1, BIO12, BIO15, DEM, HF, CLC)
+
+# -----------------------------
+# 4. Prepare Occurrence Data
+# -----------------------------
+# Make spatial
+coordinates(occ_unique) <- ~lon + lat
+
+# Remove erroneous points
+occ_unique <- occ_unique[occ_unique$lon > -110 & occ_unique$lon < -40, ]
+
+# Thin occurrence data (one per raster cell)
+cells <- cellFromXY(clim[[1]], occ_unique)
+dups <- duplicated(cells)
+occ_final <- occ_unique[!dups, ]
+
+# Plot to check
+plot(clim[[1]])
+plot(occ_final, add = TRUE, col = "red")
+
+# -----------------------------
+# 5. Define Study Area
+# -----------------------------
+# Create buffer around occurrences
+occ_buff <- buffer(occ_final, 4)
+
+# Crop and mask environmental layers
+studyArea <- crop(clim, extent(occ_buff))
+studyArea <- mask(studyArea, occ_buff)
+
+# Save clipped rasters for Maxent
+writeRaster(studyArea,
+            filename = paste0("data/studyarea/", names(studyArea), ".asc"),
+            format = "ascii",
+            bylayer = TRUE,
+            overwrite = TRUE)
+
+# -----------------------------
+# 6. Background Points
+# -----------------------------
+set.seed(1)
+bg <- sampleRandom(x = studyArea,
+                   size = 10000,
+                   na.rm = TRUE,
+                   sp = TRUE)
+
+# Plot background and occurrences
+plot(studyArea[[1]])
+plot(bg, add = TRUE)
+plot(occ_final, add = TRUE, col = "red")
+
+# -----------------------------
+# 7. Split Occurrence Data
+# -----------------------------
+set.seed(1)
+selected <- sample(1:nrow(occ_final), nrow(occ_final) * 0.5)
+occ_train <- occ_final[selected, ]
+occ_test <- occ_final[-selected, ]
+
+# -----------------------------
+# 8. Extract Environmental Values
+# -----------------------------
+p <- extract(clim, occ_train)       # training presence
+p_test <- extract(clim, occ_test)   # testing presence
+a <- extract(clim, bg)              # background points
+
+# Combine for Maxent tabular input
+pa <- c(rep(1, nrow(p)), rep(0, nrow(a)))
+pder <- as.data.frame(rbind(p, a))
+
+# -----------------------------
+# 9. Train Maxent Model
+# -----------------------------
+mod <- maxent(x = pder,
+              p = pa,
+              path = "output/maxent_outputs",
+              args = c("responsecurves"))
+
+mod # view summary
+mod@results
+
+# -----------------------------
+# 10. Predictions
+# -----------------------------
+# Project to study area
+ped1 <- predict(mod, studyArea)
+plot(ped1)
+
+# Project to training data
+ped3 <- predict(mod, p)
+hist(ped3)
+
+# -----------------------------
+# 11. Model Evaluation
+# -----------------------------
+mod_eval_train <- dismo::evaluate(p = p, a = a, model = mod)
+print(mod_eval_train)
+
+mod_eval_test <- dismo::evaluate(p = p_test, a = a, model = mod)
+print(mod_eval_test)
+
+# Thresholding
+thd1 <- threshold(mod_eval_train, "no_omission")
+thd2 <- threshold(mod_eval_train, "spec_sens")
+plot(ped1 >= thd1)
+
+# -----------------------------
+# 12. Maxent Parameter Tuning
+# -----------------------------
+# Load helper function
+source("code/Appendix2_prepPara.R")
+
+# Feature selection
+mod1_autofeature <- maxent(x = pder[c("bio1","bio4","bio11")],
+                           p = pa,
+                           path = "output/maxent_outputs1_auto",
+                           args = prepPara(userfeatures = NULL))
+
+mod1_lq <- maxent(x = pder[c("bio1","bio4","bio11")],
+                  p = pa,
+                  path = "output/maxent_outputs1_lq",
+                  args = prepPara(userfeatures = "LQ"))
+
+# Change beta multiplier
+mod2 <- maxent(x = pder[c("bio1","bio4","bio11")],
+               p = pa,
+               path = "output/maxent_outputs2_0.5",
+               args = prepPara(userfeatures = "LQ", betamultiplier = 0.5))
+
+mod2_complex <- maxent(x = pder[c("bio1","bio4","bio11")],
+                       p = pa,
+                       path = "output/maxent_outputs2_complex",
+                       args = prepPara(userfeatures = "LQH", beta_lqp = 1.5, beta_hinge = 0.5))
+
+# Projection layers
+mod3 <- maxent(x = pder[c("bio1","bio11")],
+               p = pa,
+               path = "output/maxent_outputs3_prj1",
+               args = prepPara(userfeatures = "LQ", betamultiplier = 1, 
+                               projectionlayers = "path/to/studyarea_rasters"))
+
+ped <- raster("output/maxent_outputs3_prj1/species_studyarea.asc")
+plot(ped)
+
+# Clamping
+mod4_clamp <- maxent(x = pder[c("bio1","bio11")], p = pa,
+                     path = "output/maxent_outputs4_clamp",
+                     args = prepPara(userfeatures = "LQ", betamultiplier = 1,
+                                     doclamp = TRUE, projectionlayers = "path/to/bioclim"))
+
+mod4_noclamp <- maxent(x = pder[c("bio1","bio11")], p = pa,
+                       path = "output/maxent_outputs4_noclamp",
+                       args = prepPara(userfeatures = "LQ", betamultiplier = 1,
+                                       doclamp = FALSE, projectionlayers = "path/to/bioclim"))
+
+ped_clamp <- raster("output/maxent_outputs4_clamp/species_bioclim.asc")
+ped_noclamp <- raster("output/maxent_outputs4_noclamp/species_bioclim.asc")
+plot(stack(ped_clamp, ped_noclamp))
+plot(ped_clamp - ped_noclamp)
+
+# Cross-validation
+mod4_cross <- maxent(x = pder[c("bio1","bio11")], p = pa,
+                     path = "output/maxent_outputs4_cross",
+                     args = prepPara(userfeatures = "LQ", betamultiplier = 1, 
+                                     doclamp = TRUE,
+                                     projectionlayers = "path/to/bioclim",
+                                     replicates = 5, replicatetype = "crossvalidate"))
